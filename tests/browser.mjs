@@ -1,0 +1,40 @@
+import {chromium,expect} from '@playwright/test';
+import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import assert from 'node:assert/strict';
+import {makePDF} from './pdf-fixture.mjs';
+await mkdir('test-results',{recursive:true});
+const browser=await chromium.launch({headless:true});const context=await browser.newContext({viewport:{width:390,height:844},deviceScaleFactor:1,isMobile:true,hasTouch:true,acceptDownloads:true});
+const appURL=process.env.APP_URL||'http://127.0.0.1:4173/';
+const page=await context.newPage(),errors=[],requests=[];
+page.on('pageerror',e=>errors.push(e.message));context.on('request',r=>requests.push({url:r.url(),method:r.method()}));page.on('dialog',d=>d.accept());
+await page.addInitScript(()=>{document.modelContext={registerTool(t){window.reviewTool=t;}};});
+try{
+ await page.goto(appURL);await expect(page.locator('#offline-status')).toHaveText('Ready to use offline',{timeout:120000});
+ const manifest=await page.evaluate(async()=>{const link=document.querySelector('link[rel=manifest]');const url=new URL(link.href);return {url:url.href,data:await (await fetch(url)).json()};});
+ assert.equal(new URL(manifest.data.start_url,manifest.url).pathname,new URL(appURL).pathname);
+ const cdp=await context.newCDPSession(page);const installability=await cdp.send('Page.getInstallabilityErrors');assert.deepEqual(installability.installabilityErrors,[]);
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ await page.screenshot({path:'test-results/mobile-start.png',fullPage:true});
+ const tools=await page.evaluate(async()=>({name:window.reviewTool.name,status:await window.reviewTool.execute({}),invalid:await (async()=>{try{await window.reviewTool.execute({unknown:true});return false;}catch{return true;}})()}));assert.equal(tools.name,'get_local_review_status');assert.equal(tools.status.pages,0);assert.equal(tools.invalid,true);
+ await context.setOffline(true);await page.reload();await expect(page.locator('#offline-status')).toHaveText('Ready to use offline',{timeout:20000});
+ await page.locator('#sample').click();const start=Date.now();await page.locator('#extract').click();await expect(page.locator('#text')).toBeVisible({timeout:120000});await expect(page.locator('#text')).toContainText('amlodip',{timeout:10000});const ocrMs=Date.now()-start;
+ const extracted=await page.locator('#text').inputValue();assert.match(extracted,/900101/);
+ await page.locator('#preview-tab').click();const redacted=await page.locator('#redacted').innerText();assert.ok(!redacted.includes('900101/1234'));assert.ok(!redacted.includes('jan.skusobny@example.test'));assert.match(redacted,/amlodip/);
+ await page.locator('#reviewed').check();await page.locator('#approve').click();await expect(page.locator('#export')).toBeEnabled();
+ const downloadPromise=page.waitForEvent('download');await page.locator('#export').click();const download=await downloadPromise;await download.saveAs('test-results/redacted.txt');const exported=await readFile('test-results/redacted.txt','utf8');assert.ok(!exported.includes('900101/1234'));assert.match(exported,/Page 1/);
+ await page.locator('#text-tab').click();await page.locator('#text').fill(extracted+'\nPrivate phrase ZXQ\nsecretmanual');await expect(page.locator('#export')).toBeDisabled();await page.locator('#text').evaluate(el=>{el.focus();const at=el.value.indexOf('secretmanual');el.setSelectionRange(at,at+12);});await page.locator('#redact-selection').click();await page.locator('#custom').fill('Private phrase ZXQ');await page.locator('#add-term').click();await page.locator('#preview-tab').click();assert.ok(!(await page.locator('#redacted').innerText()).includes('Private phrase ZXQ'));assert.ok(!(await page.locator('#redacted').innerText()).includes('secretmanual'));
+ await page.locator('summary').click();await page.locator('#password').fill('testing local encryption 123');await page.locator('#save').click();await expect(page.locator('#notice')).toContainText('Encrypted session saved');
+ const db=await page.evaluate(()=>new Promise(resolve=>{const r=indexedDB.open('zdravotnik-vault');r.onsuccess=()=>{const db=r.result,q=db.transaction('vault').objectStore('vault').get('session');q.onsuccess=()=>{resolve(q.result);db.close();};};}));assert.equal(db.format,'zdravotnik-v1');assert.ok(!JSON.stringify(db).includes('900101'));
+ await page.locator('summary').click();await page.locator('#lock').click();await expect(page.locator('.page-item')).toHaveCount(0);
+ await page.locator('summary').click();await page.locator('#password').fill('testing local encryption 123');await page.locator('#unlock').click();await expect(page.locator('.page-item')).toHaveCount(1);await expect(page.locator('#export')).toBeDisabled();
+ await page.locator('#preview-tab').click();assert.ok(!(await page.locator('#redacted').innerText()).includes('secretmanual'));
+ // Import a mixed PDF offline: text extraction plus an image-only page.
+ await page.locator('#original-tab').click();const jpg=await page.locator('img.original').evaluate(img=>{const c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;c.getContext('2d').drawImage(img,0,0);return {url:c.toDataURL('image/jpeg',.95),width:c.width,height:c.height};});
+ const pdf=makePDF(Buffer.from(jpg.url.split(',')[1],'base64'),jpg.width,jpg.height);await page.locator('#files').setInputFiles({name:'fictional-private-name.pdf',mimeType:'application/pdf',buffer:pdf});await expect(page.locator('.page-item')).toHaveCount(3,{timeout:30000});await expect(page.locator('#extract')).toBeEnabled();
+ await page.locator('[data-page="1"]').click();await page.locator('#text-tab').click();await expect(page.locator('#text')).toContainText('Jan Testovsky');await page.locator('#preview-tab').click();assert.ok(!(await page.locator('#redacted').innerText()).includes('Jan Testovsky'));
+ await page.locator('[data-page="2"]').click();await page.locator('#extract').click();await expect(page.locator('#text')).toBeVisible({timeout:120000});await expect(page.locator('#text')).toContainText('amlodip');
+ await page.screenshot({path:'test-results/mobile-review.png',fullPage:true});
+ await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:'test-results/desktop-review.png',fullPage:true});
+ assert.deepEqual(errors,[]);assert.equal(requests.filter(r=>!r.url.startsWith(new URL(appURL).origin+'/')&&!r.url.startsWith('blob:')&&!r.url.startsWith('data:')).length,0);assert.ok(requests.every(r=>r.method==='GET'));
+ const report={passed:true,ocrMs,browser:'Chromium mobile viewport; desktop CPU',offlineReload:true,offlineOCR:true,mixedPDFOffline:true,redactionExport:true,approvalInvalidation:true,encryptedSaveUnlock:true,manualRedactionPreserved:true,externalRequests:0,errors,webMCP:'API stub validated; native support unavailable'};await writeFile('test-results/browser-report.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));
+}catch(e){await page.screenshot({path:'test-results/failure.png',fullPage:true});console.error('PAGE ERRORS',errors);throw e;}finally{await browser.close();}

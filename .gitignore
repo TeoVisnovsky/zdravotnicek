@@ -1,0 +1,7 @@
+node_modules/
+dist/
+public/ocr/
+public/pdf/
+test-results/
+.sites-runtime/
+*.tar.gz
